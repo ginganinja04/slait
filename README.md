@@ -43,7 +43,7 @@ SLAIT follows a simple client–server + sandbox architecture:
 
 **Maria Linkins-Nielsen**  
 Backend Developer – NASM execution pipeline, Docker sandbox, gdb integration, API design  
-GitHub: https://github.com/<your-username>
+GitHub: https://github.com/ginganinja04
 
 **Michael Bratcher**  
 Frontend Developer – Angular UI, code editor, inspection interface, results visualization  
