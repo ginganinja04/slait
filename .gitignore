@@ -1,0 +1,19 @@
+# --- SLAIT outputs / runtime ---
+**/test_run/
+**/out/
+**/runs/
+**/*.log
+
+# build artifacts
+**/*.o
+**/program
+**/program_output.txt
+**/register_dump.txt
+**/inspect.gdb
+
+# python
+**/__pycache__/
+**/*.pyc
+
+# OS
+.DS_Store
