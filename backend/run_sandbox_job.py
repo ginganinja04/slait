@@ -6,7 +6,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-
+import json
+from parse_register_dump import parse_register_dump
 
 def sh(cmd: list[str], *, check: bool = True, capture: bool = False, text: bool = True) -> subprocess.CompletedProcess:
     """Run a shell command safely (no shell=True)."""
@@ -97,6 +98,15 @@ def run_job(
 
         stdout_text = prog_out_host.read_text(errors="replace")
         reg_text = reg_out_host.read_text(errors="replace")
+
+        bps = parse_register_dump(reg_text)
+        payload = {
+            "stdout": stdout_text,
+            "breakpoints": bps,
+            "raw_register_dump": reg_text,  # keep for debugging; can remove later
+        }       
+        
+        print(json.dumps(payload, indent=2))
 
         if exec_res.returncode != 0:
             raise RuntimeError(

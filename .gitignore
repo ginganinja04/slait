@@ -1,5 +1,4 @@
 # --- SLAIT outputs / runtime ---
-**/test_run/
 **/out/
 **/runs/
 **/*.log
