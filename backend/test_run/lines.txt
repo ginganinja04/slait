@@ -1,0 +1,2 @@
+line:9, rax:1, rbx:1, rcx:0
+line:10, rax:1, rbx:1, rcx:0
