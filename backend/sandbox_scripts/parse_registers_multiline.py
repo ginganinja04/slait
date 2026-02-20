@@ -51,6 +51,9 @@ def generate_gdb_script(configs, binary_path: str, out_path: str):
         f.write(f"set logging file {out_path}\n")
         f.write("set logging overwrite on\n")
         f.write("set logging enabled on\n")
+        f.write("set verbose off\n")
+        f.write("set complaints 0\n") #testing
+        f.write("set print thread-events off\n") #testing
         f.write(f"file {binary_path}\n\n")
 
         # Create breakpoints first
