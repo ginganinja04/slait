@@ -7,7 +7,66 @@ import sys
 import tempfile
 from pathlib import Path
 import json
-from parse_register_dump import parse_register_dump
+import re
+from typing import Any, Dict, List
+## from parse_register_dump import parse_register_dump
+
+_BP_RE = re.compile(r"^=== Breakpoint at line (\d+) ===$")
+# Accept: rax: 0x1  OR  rax: 1  (handles both until you standardize)
+_REG_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9]{1,4}):\s+(0x[0-9a-fA-F]+|[0-9a-fA-F]+)$")
+
+def parse_register_dump(raw: str) -> List[Dict[str, Any]]:
+    """
+    Parse register_dump.txt content into structured breakpoints.
+
+    Expected blocks:
+      === Breakpoint at line 9 ===
+      rax: 0x1
+      rbx: 0x0
+
+    Ignores all other GDB noise.
+    Returns:
+      [
+        {"line": 9, "registers": {"rax": "0x1", "rbx": "0x0"}},
+        ...
+      ]
+    """
+    breakpoints: List[Dict[str, Any]] = []
+    current: Dict[str, Any] | None = None
+
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        m = _BP_RE.match(line)
+        if m:
+            if current is not None:
+                breakpoints.append(current)
+            current = {"line": int(m.group(1)), "registers": {}}
+            continue
+
+        m = _REG_RE.match(line)
+        if m and current is not None:
+            reg = m.group(1)
+            val = m.group(2)
+            # Normalize values: ensure 0x prefix for hex-looking values if missing
+            if not val.startswith("0x"):
+                # if it contains any a-f chars, treat as hex
+                if any(c in "abcdefABCDEF" for c in val):
+                    val = "0x" + val.lower()
+                else:
+                    # treat as decimal -> keep as-is or convert; keeping as-is is fine for now
+                    pass
+            current["registers"][reg] = val
+            continue
+
+        # Ignore everything else (Breakpoint X at..., warnings, inferior exit, etc.)
+
+    if current is not None:
+        breakpoints.append(current)
+
+    return breakpoints
 
 def sh(cmd: list[str], *, check: bool = True, capture: bool = False, text: bool = True) -> subprocess.CompletedProcess:
     """Run a shell command safely (no shell=True)."""
@@ -99,13 +158,19 @@ def run_job(
         stdout_text = prog_out_host.read_text(errors="replace")
         reg_text = reg_out_host.read_text(errors="replace")
 
+        breakpoints = parse_register_dump(reg_text)
+
         bps = parse_register_dump(reg_text)
         payload = {
+            "ok": True,
             "stdout": stdout_text,
-            "breakpoints": bps,
+            "breakpoints": breakpoints,
             "raw_register_dump": reg_text,  # keep for debugging; can remove later
+            "metadata": {
+                "image": args.image,
+            },
         }       
-        
+
         print(json.dumps(payload, indent=2))
 
         if exec_res.returncode != 0:
