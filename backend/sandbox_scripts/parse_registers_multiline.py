@@ -67,7 +67,7 @@ def generate_gdb_script(configs, binary_path: str, out_path: str):
             f.write(f'  echo \\n=== Breakpoint at line {line_no} ===\\n\n')
             if tracked_regs:
                 for reg in tracked_regs:
-                    f.write(f'  printf "{reg}: 0x%lx\\n", ${reg}\n') ## changed to hex representation for better readability
+                    f.write(f'  printf "{reg}: 0x%016lx\\n", ${reg}\n') ## changed to hex representation for better readability
             else:
                 f.write('  echo (No registers selected)\\n\n')
             f.write("  continue\n")

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import os
 import shutil
 import subprocess
 import sys
@@ -11,26 +10,22 @@ import re
 from typing import Any, Dict, List
 ## from parse_register_dump import parse_register_dump
 
-_BP_RE = re.compile(r"^=== Breakpoint at line (\d+) ===$")
-# Accept: rax: 0x1  OR  rax: 1  (handles both until you standardize)
-_REG_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9]{1,4}):\s+(0x[0-9a-fA-F]+|[0-9a-fA-F]+)$")
+# Helper functions
+def u64_to_bytes_le(u64: int) -> bytes:
+    return u64.to_bytes(8, byteorder="little", signed=False)
+
+def bytes_to_hex_pairs(b: bytes) -> str:
+    return " ".join(f"{x:02x}" for x in b)
+
+def bytes_to_ascii(b: bytes) -> str:
+    return "".join(chr(x) if 32 <= x <= 126 else "." for x in b)
+
+
+
+_BP_RE = re.compile(r"^===\s*Breakpoint\s+at\s+line\s+(\d+)\s*===\s*$")
+_REG_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9]{1,4}):\s*(0x[0-9a-fA-F]+)\s*$")
 
 def parse_register_dump(raw: str) -> List[Dict[str, Any]]:
-    """
-    Parse register_dump.txt content into structured breakpoints.
-
-    Expected blocks:
-      === Breakpoint at line 9 ===
-      rax: 0x1
-      rbx: 0x0
-
-    Ignores all other GDB noise.
-    Returns:
-      [
-        {"line": 9, "registers": {"rax": "0x1", "rbx": "0x0"}},
-        ...
-      ]
-    """
     breakpoints: List[Dict[str, Any]] = []
     current: Dict[str, Any] | None = None
 
@@ -39,41 +34,60 @@ def parse_register_dump(raw: str) -> List[Dict[str, Any]]:
         if not line:
             continue
 
+        # Breakpoint header
         m = _BP_RE.match(line)
         if m:
+            # save previous block
             if current is not None:
                 breakpoints.append(current)
+
             current = {"line": int(m.group(1)), "registers": {}}
             continue
 
+        # Register line (only if we're inside a breakpoint block)
         m = _REG_RE.match(line)
         if m and current is not None:
             reg = m.group(1)
-            val = m.group(2)
-            # Normalize values: ensure 0x prefix for hex-looking values if missing
-            if not val.startswith("0x"):
-                # if it contains any a-f chars, treat as hex
-                if any(c in "abcdefABCDEF" for c in val):
-                    val = "0x" + val.lower()
-                else:
-                    # treat as decimal -> keep as-is or convert; keeping as-is is fine for now
-                    pass
-            current["registers"][reg] = val
+            val_str = m.group(2)
+
+            u64 = int(val_str, 16)
+
+            # signed view
+            i64 = u64 - (1 << 64) if (u64 & (1 << 63)) else u64
+
+            b = u64_to_bytes_le(u64)
+
+            current["registers"][reg] = {
+                "hex": f"0x{u64:016x}",
+                "u64": u64,
+                "i64": i64,
+                "bytes_le": bytes_to_hex_pairs(b),
+                "ascii_le": bytes_to_ascii(b),
+            }
             continue
 
-        # Ignore everything else (Breakpoint X at..., warnings, inferior exit, etc.)
-
+        # ignore everything else (gdb noise)
     if current is not None:
         breakpoints.append(current)
 
     return breakpoints
 
-def sh(cmd: list[str], *, check: bool = True, capture: bool = False, text: bool = True) -> subprocess.CompletedProcess:
-    """Run a shell command safely (no shell=True)."""
+def sh(
+    cmd: list[str],
+    *,
+    check: bool = True,
+    capture: bool = False,
+    text: bool = True,
+    quiet: bool = False,
+    ) -> subprocess.CompletedProcess:
+    """Run a command. quiet=True suppresses stdout/stderr unless capture=True."""
     if capture:
         return subprocess.run(cmd, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text)
-    return subprocess.run(cmd, check=check)
 
+    if quiet:
+        return subprocess.run(cmd, check=check, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return subprocess.run(cmd, check=check)
 
 def ensure_docker_available() -> None:
     try:
@@ -88,7 +102,8 @@ def run_job(
     lines_path: Path,
     pipeline_cmd: list[str],
     keep_tmp: bool = False,
-) -> tuple[str, str, str]:
+    json_only: bool = False,
+) -> tuple[str, str, str, dict]:
     """
     Returns (stdout_text, register_dump_text, docker_logs_text).
     """
@@ -116,11 +131,11 @@ def run_job(
             raise RuntimeError("Failed to create container (no container id returned).")
 
         # Start it
-        sh(["docker", "start", cid], check=True)
+        sh(["docker", "start", cid], check=True, quiet=json_only)
 
         # Copy inputs into container
-        sh(["docker", "cp", str(asm_path), f"{cid}:/work/program.asm"], check=True)
-        sh(["docker", "cp", str(lines_path), f"{cid}:/work/lines.txt"], check=True)
+        sh(["docker", "cp", str(asm_path), f"{cid}:/work/program.asm"], check=True, quiet=json_only)
+        sh(["docker", "cp", str(lines_path), f"{cid}:/work/lines.txt"], check=True, quiet=json_only)
 
         # Run pipeline inside container (capture logs)
         exec_res = sh(["docker", "exec", cid, *pipeline_cmd], check=False, capture=True)
@@ -132,13 +147,12 @@ def run_job(
             pass
 
         # Copy outputs out (expected locations inside container)
-        # These match your pipeline: /work/program_output.txt and /work/register_dump.txt
-        # If either is missing, we'll raise with a helpful message.
+        # If either is missing, it'll raise with a helpful message.
         prog_out_host = out_dir / "program_output.txt"
         reg_out_host = out_dir / "register_dump.txt"
 
         try:
-            sh(["docker", "cp", f"{cid}:/work/program_output.txt", str(prog_out_host)], check=True)
+            sh(["docker", "cp", f"{cid}:/work/program_output.txt", str(prog_out_host)], check=True, quiet=json_only)
         except Exception:
             raise RuntimeError(
                 "Pipeline did not produce /work/program_output.txt inside the container.\n"
@@ -147,7 +161,7 @@ def run_job(
             )
 
         try:
-            sh(["docker", "cp", f"{cid}:/work/register_dump.txt", str(reg_out_host)], check=True)
+            sh(["docker", "cp", f"{cid}:/work/register_dump.txt", str(reg_out_host)], check=True, quiet=json_only)
         except Exception:
             raise RuntimeError(
                 "Pipeline did not produce /work/register_dump.txt inside the container.\n"
@@ -160,18 +174,17 @@ def run_job(
 
         breakpoints = parse_register_dump(reg_text)
 
-        bps = parse_register_dump(reg_text)
+        
         payload = {
             "ok": True,
             "stdout": stdout_text,
             "breakpoints": breakpoints,
-            "raw_register_dump": reg_text,  # keep for debugging; can remove later
+           ## "raw_register_dump": reg_text,  # keep for debugging; can remove later
             "metadata": {
-                "image": args.image,
+                "image": image,
             },
         }       
 
-        print(json.dumps(payload, indent=2))
 
         if exec_res.returncode != 0:
             raise RuntimeError(
@@ -181,13 +194,13 @@ def run_job(
                 f"--- register_dump.txt ---\n{reg_text}\n"
             )
 
-        return stdout_text, reg_text, logs
+        return stdout_text, reg_text, logs, payload
 
     finally:
         # Always cleanup container
         if cid:
             try:
-                sh(["docker", "rm", "-f", cid], check=False, capture=True)
+                sh(["docker", "rm", "-f", cid], check=False, capture=True, quiet=json_only)
             except Exception:
                 pass
 
@@ -204,6 +217,7 @@ def main() -> int:
     parser.add_argument("--asm", required=True, help="Path to program.asm on host")
     parser.add_argument("--lines", required=True, help="Path to lines.txt on host")
     parser.add_argument("--keep-tmp", action="store_true", help="Keep temp output directory for debugging")
+    parser.add_argument("--json", action="store_true", help="Output JSON only")
     args = parser.parse_args()
 
     ensure_docker_available()
@@ -215,21 +229,25 @@ def main() -> int:
     pipeline_cmd = ["bash", "-lc", "/app/scripts/run_pipeline.sh /work/program.asm /work/lines.txt"]
 
     try:
-        stdout_text, reg_text, logs = run_job(
+        stdout_text, reg_text, logs, payload = run_job(
             image=args.image,
             asm_path=asm_path,
             lines_path=lines_path,
             pipeline_cmd=pipeline_cmd,
             keep_tmp=args.keep_tmp,
+            json_only=args.json,
         )
     except Exception as e:
         print(f"[SLAIT] ERROR: {e}", file=sys.stderr)
         return 1
 
-    print("===== program_output.txt =====")
-    print(stdout_text.rstrip("\n"))
-    print("\n===== register_dump.txt =====")
-    print(reg_text.rstrip("\n"))
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print("===== program_output.txt =====")
+        print(stdout_text.rstrip("\n"))
+        print("\n===== register_dump.txt =====")
+        print(reg_text.rstrip("\n"))
 
     return 0
 
