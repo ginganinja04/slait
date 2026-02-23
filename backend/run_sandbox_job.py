@@ -8,9 +8,8 @@ from pathlib import Path
 import json
 import re
 from typing import Any, Dict, List
-## from parse_register_dump import parse_register_dump
 
-# Helper functions
+# Helper functions for multiple representations
 def u64_to_bytes_le(u64: int) -> bytes:
     return u64.to_bytes(8, byteorder="little", signed=False)
 
@@ -120,7 +119,7 @@ def run_job(
     logs = ""
 
     try:
-        # Create container (not started yet). Use a long sleep so we can docker exec.
+        # Create container (not started yet). Uses a long sleep so we can docker exec.
         create = sh(
             ["docker", "create", image, "bash", "-lc", "sleep infinity"],
             capture=True,
