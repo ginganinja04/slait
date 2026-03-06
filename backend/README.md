@@ -44,13 +44,14 @@ This backend executes user-provided x86-64 NASM assembly inside a Docker sandbox
   - `line:<N>, <reg1>:<0|1>, <reg2>:<0|1>, ...`
 - `line:<N>` is required.
 - Any register with flag `1` is captured at that breakpoint.
+- Flag register tracking is supported using `rflags` (or `eflags`).
 - Blank lines and `#` comments are ignored.
 
 Example:
 
 ```txt
-line:9, rax:1, rbx:1, rcx:1
-line:10, rax:1, rbx:1, rcx:0
+line:9, rax:1, rbx:1, rcx:1, rflags:1
+line:10, rax:1, rbx:1, rcx:0, rflags:1
 ```
 
 ## Outputs
@@ -69,6 +70,7 @@ From `run_sandbox_job.py --json`:
   - `i64`
   - `bytes_le`
   - `ascii_le`
+  - `flags` (for `rflags`/`eflags`), decoded bits like `zf`, `cf`, `of`, `sf`, etc.
 
 ## Build and Test
 

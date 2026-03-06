@@ -9,6 +9,13 @@ import json
 import re
 from typing import Any, Dict, List
 
+class SandboxJobError(Exception):
+    def __init__(self, stage: str, message: str, details: str | None = None):
+        super().__init__(message)
+        self.stage = stage
+        self.message = message
+        self.details = details
+
 # Helper functions for multiple representations
 def u64_to_bytes_le(u64: int) -> bytes:
     return u64.to_bytes(8, byteorder="little", signed=False)
@@ -19,10 +26,64 @@ def bytes_to_hex_pairs(b: bytes) -> str:
 def bytes_to_ascii(b: bytes) -> str:
     return "".join(chr(x) if 32 <= x <= 126 else "." for x in b)
 
-
+def make_error_payload(stage: str, message: str, details: str | None = None) -> dict:
+    payload = {
+        "ok": False,
+        "error": {
+            "stage": stage,
+            "message": message,
+        },
+    }
+    if details:
+        payload["error"]["details"] = details
+    return payload
 
 _BP_RE = re.compile(r"^===\s*Breakpoint\s+at\s+line\s+(\d+)\s*===\s*$")
-_REG_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9]{1,4}):\s*(0x[0-9a-fA-F]+)\s*$")
+_REG_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9]{1,15}):\s*(0x[0-9a-fA-F]+)\s*$")
+
+_RFLAGS_BITS = [
+    (0, "cf"),
+    (2, "pf"),
+    (4, "af"),
+    (6, "zf"),
+    (7, "sf"),
+    (8, "tf"),
+    (9, "if"),
+    (10, "df"),
+    (11, "of"),
+    (14, "nt"),
+    (16, "rf"),
+    (17, "vm"),
+    (18, "ac"),
+    (19, "vif"),
+    (20, "vip"),
+    (21, "id"),
+]
+
+def decode_rflags(u64: int) -> Dict[str, int]:
+    return {name: (u64 >> bit) & 1 for bit, name in _RFLAGS_BITS}
+
+def infer_pipeline_stage(logs: str) -> str:
+    text = logs.lower()
+
+    if "[4/4] capturing registers via gdb" in text or "gdb" in text:
+        return "register_capture"
+    if "[3/4] running binary" in text:
+        return "run"
+    if "[2/4] linking" in text:
+        return "link"
+    if "[1/4] assembling" in text or "nasm" in text:
+        return "assemble"
+    return "docker_exec"
+
+def extract_error_line(logs: str) -> str | None:
+    for line in logs.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if "error:" in s.lower():
+            return s
+    return None
 
 def parse_register_dump(raw: str) -> List[Dict[str, Any]]:
     breakpoints: List[Dict[str, Any]] = []
@@ -47,6 +108,7 @@ def parse_register_dump(raw: str) -> List[Dict[str, Any]]:
         m = _REG_RE.match(line)
         if m and current is not None:
             reg = m.group(1)
+            reg_l = reg.lower()
             val_str = m.group(2)
 
             u64 = int(val_str, 16)
@@ -63,6 +125,9 @@ def parse_register_dump(raw: str) -> List[Dict[str, Any]]:
                 "bytes_le": bytes_to_hex_pairs(b),
                 "ascii_le": bytes_to_ascii(b),
             }
+
+            if reg_l in {"rflags", "eflags", "flags"}:
+                current["registers"][reg]["flags"] = decode_rflags(u64)
             continue
 
         # ignore everything else (gdb noise)
@@ -92,8 +157,7 @@ def ensure_docker_available() -> None:
     try:
         sh(["docker", "version"], check=True, capture=True)
     except Exception as e:
-        raise RuntimeError("Docker does not seem available. Is Docker running and are you in the docker group?") from e
-
+        raise SandboxJobError("docker_check", "Docker does not seem to be available or working.", details=str(e))
 
 def run_job(
     image: str,
@@ -127,7 +191,7 @@ def run_job(
         )
         cid = create.stdout.strip()
         if not cid:
-            raise RuntimeError("Failed to create container (no container id returned).")
+            raise SandboxJobError("docker_create", "Failed to create container (no container id returned).")
 
         # Start it
         sh(["docker", "start", cid], check=True, quiet=json_only)
@@ -153,19 +217,29 @@ def run_job(
         try:
             sh(["docker", "cp", f"{cid}:/work/program_output.txt", str(prog_out_host)], check=True, quiet=json_only)
         except Exception:
-            raise RuntimeError(
-                "Pipeline did not produce /work/program_output.txt inside the container.\n"
-                "Check docker logs below.\n"
-                f"--- Docker logs ---\n{logs}"
+            stage = infer_pipeline_stage(logs)
+            err_line = extract_error_line(logs)
+            message = "Pipeline did not produce /work/program_output.txt inside the container."
+            if err_line:
+                message = f"{message} {err_line}"
+            raise SandboxJobError(
+                stage,
+                message,
+                f"--- Docker logs ---\n{logs}",
             )
 
         try:
             sh(["docker", "cp", f"{cid}:/work/register_dump.txt", str(reg_out_host)], check=True, quiet=json_only)
         except Exception:
-            raise RuntimeError(
-                "Pipeline did not produce /work/register_dump.txt inside the container.\n"
-                "Check docker logs below.\n"
-                f"--- Docker logs ---\n{logs}"
+            stage = infer_pipeline_stage(logs)
+            err_line = extract_error_line(logs)
+            message = "Pipeline did not produce /work/register_dump.txt inside the container."
+            if err_line:
+                message = f"{message} {err_line}"
+            raise SandboxJobError(
+                stage,
+                message,
+                f"--- Docker logs ---\n{logs}",
             )
 
         stdout_text = prog_out_host.read_text(errors="replace")
@@ -186,11 +260,15 @@ def run_job(
 
 
         if exec_res.returncode != 0:
-            raise RuntimeError(
-                f"Pipeline returned non-zero exit code: {exec_res.returncode}\n"
-                f"--- Docker logs ---\n{logs}\n"
-                f"--- program_output.txt ---\n{stdout_text}\n"
-                f"--- register_dump.txt ---\n{reg_text}\n"
+            stage = infer_pipeline_stage(logs)
+            err_line = extract_error_line(logs)
+            message = f"Pipeline returned non-zero exit code: {exec_res.returncode}"
+            if err_line:
+                message = f"{message}. {err_line}"
+            raise SandboxJobError(
+                stage,
+                message,
+                f"docker_logs:\n{logs}\n\nprogram_output:\n{stdout_text}\n\nregister_dump:\n{reg_text}",
             )
 
         return stdout_text, reg_text, logs, payload
@@ -236,8 +314,27 @@ def main() -> int:
             keep_tmp=args.keep_tmp,
             json_only=args.json,
         )
+    except FileNotFoundError as e:
+        if args.json:
+            print(json.dumps(make_error_payload("input_validation", str(e)), indent=2))
+        else:
+            print(f"[SLAIT] ERROR (input_validation): {e}", file=sys.stderr)
+        return 1
+
+    except SandboxJobError as e:
+        if args.json:
+            print(json.dumps(make_error_payload(e.stage, e.message, e.details), indent=2))
+        else:
+            print(f"[SLAIT] ERROR ({e.stage}): {e.message}", file=sys.stderr)
+            if e.details:
+                print(e.details, file=sys.stderr)
+        return 1
+
     except Exception as e:
-        print(f"[SLAIT] ERROR: {e}", file=sys.stderr)
+        if args.json:
+            print(json.dumps(make_error_payload("unknown", str(e)), indent=2))
+        else:
+            print(f"[SLAIT] ERROR: {e}", file=sys.stderr)
         return 1
 
     if args.json:
